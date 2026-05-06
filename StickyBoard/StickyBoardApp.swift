@@ -105,27 +105,25 @@ class CanvasView: NSView {
         guard let d = appDelegate, d.editMode else { return }
         let loc = convert(event.locationInWindow, from: nil)
 
-        // Resize handle — always first priority
-        if let (id, view) = d.hitTestResizeHandle(loc) {
+        // Resize handle
+        if let (id, c) = d.hitTestResizeHandle(loc) {
             d.resizeElement = id
             d.resizeStart = loc
-            d.resizeOriginalFrame = view.frame
+            d.resizeOriginalSize = c.contentView.frame.size
             return
         }
 
-        // Check if clicking on element's edge (border area) → drag
-        if let (id, view) = d.hitTestBorder(loc) {
+        // Drag handle
+        if let (id, c) = d.hitTestBorder(loc) {
             d.dragElement = id
             d.dragStart = loc
-            d.dragOrigin = view.frame.origin
+            d.dragOrigin = c.contentFrame.origin
             d.didDrag = false
             return
         }
 
-        // Click inside element content → let the text field handle it naturally
-        if d.hitTest(loc) != nil {
-            return // pass through to text field
-        }
+        // Click inside element content → let text field handle it
+        if d.hitTest(loc) != nil { return }
 
         // Empty space → exit edit mode
         d.exitEditMode()
@@ -135,18 +133,17 @@ class CanvasView: NSView {
         guard let d = appDelegate, d.editMode else { return }
         let loc = convert(event.locationInWindow, from: nil)
 
-        if let id = d.resizeElement, let view = d.elementViews[id] {
+        if let id = d.resizeElement, let c = d.containers[id] {
             let dx = loc.x - d.resizeStart.x
             let dy = loc.y - d.resizeStart.y
-            view.frame.size = NSSize(width: max(40, d.resizeOriginalFrame.width + dx),
-                                     height: max(20, d.resizeOriginalFrame.height + dy))
-            d.syncHandlePositions()
-        } else if let id = d.dragElement, let view = d.elementViews[id] {
+            let newSize = NSSize(width: max(40, d.resizeOriginalSize.width + dx),
+                                 height: max(20, d.resizeOriginalSize.height + dy))
+            c.updateContentSize(newSize)
+        } else if let id = d.dragElement, let c = d.containers[id] {
             let dx = loc.x - d.dragStart.x
             let dy = loc.y - d.dragStart.y
             d.didDrag = true
-            view.frame.origin = NSPoint(x: d.dragOrigin.x + dx, y: d.dragOrigin.y + dy)
-            d.syncHandlePositions()
+            c.updatePosition(NSPoint(x: d.dragOrigin.x + dx, y: d.dragOrigin.y + dy))
         }
     }
 
@@ -167,6 +164,90 @@ class CanvasView: NSView {
     }
 }
 
+// MARK: - Element Container (content + handles)
+
+class ElementContainerView: NSView {
+    override var isFlipped: Bool { true }
+    let contentView: NSView
+    let dragHandle = NSView()
+    let resizeHandle = NSView()
+    private let handleSize: CGFloat = 12
+
+    init(content: NSView) {
+        self.contentView = content
+        super.init(frame: .zero)
+        wantsLayer = true
+
+        // Content fills container
+        addSubview(contentView)
+
+        // Drag handle — blue circle, top center
+        dragHandle.wantsLayer = true
+        dragHandle.layer?.backgroundColor = NSColor.systemBlue.cgColor
+        dragHandle.layer?.cornerRadius = handleSize / 2
+        addSubview(dragHandle)
+
+        // Resize handle — orange circle, bottom right
+        resizeHandle.wantsLayer = true
+        resizeHandle.layer?.backgroundColor = NSColor.systemOrange.cgColor
+        resizeHandle.layer?.cornerRadius = handleSize / 2
+        addSubview(resizeHandle)
+
+        setHandlesVisible(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func layout(for elementFrame: NSRect) {
+        let pad: CGFloat = handleSize + 4
+        // Container is larger than content to fit handles
+        frame = NSRect(x: elementFrame.origin.x, y: elementFrame.origin.y - pad,
+                       width: elementFrame.width, height: elementFrame.height + pad * 2)
+        contentView.frame = NSRect(x: 0, y: pad, width: elementFrame.width, height: elementFrame.height)
+        dragHandle.frame = NSRect(x: (elementFrame.width - handleSize) / 2, y: 0, width: handleSize, height: handleSize)
+        resizeHandle.frame = NSRect(x: elementFrame.width - handleSize / 2, y: pad + elementFrame.height + 4, width: handleSize, height: handleSize)
+    }
+
+    func setHandlesVisible(_ visible: Bool) {
+        dragHandle.isHidden = !visible
+        resizeHandle.isHidden = !visible
+    }
+
+    /// Content frame in canvasView coordinates
+    var contentFrame: NSRect {
+        NSRect(x: frame.origin.x + contentView.frame.origin.x,
+               y: frame.origin.y + contentView.frame.origin.y,
+               width: contentView.frame.width, height: contentView.frame.height)
+    }
+
+    /// Drag handle frame in canvasView coordinates
+    var dragHandleFrame: NSRect {
+        NSRect(x: frame.origin.x + dragHandle.frame.origin.x,
+               y: frame.origin.y + dragHandle.frame.origin.y,
+               width: dragHandle.frame.width, height: dragHandle.frame.height)
+    }
+
+    /// Resize handle frame in canvasView coordinates
+    var resizeHandleFrame: NSRect {
+        NSRect(x: frame.origin.x + resizeHandle.frame.origin.x,
+               y: frame.origin.y + resizeHandle.frame.origin.y,
+               width: resizeHandle.frame.width, height: resizeHandle.frame.height)
+    }
+
+    func updateContentSize(_ size: NSSize) {
+        let pad: CGFloat = handleSize + 4
+        frame.size = NSSize(width: size.width, height: size.height + pad * 2)
+        contentView.frame.size = size
+        dragHandle.frame.origin.x = (size.width - handleSize) / 2
+        resizeHandle.frame = NSRect(x: size.width - handleSize / 2, y: pad + size.height + 4, width: handleSize, height: handleSize)
+    }
+
+    func updatePosition(_ origin: NSPoint) {
+        let pad: CGFloat = handleSize + 4
+        frame.origin = NSPoint(x: origin.x, y: origin.y - pad)
+    }
+}
+
 // MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
@@ -175,7 +256,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     var canvas: NSWindow!
     var canvasView: CanvasView!
     var editMode = false
-    var elementViews: [UUID: NSView] = [:]
+    var containers: [UUID: ElementContainerView] = [:]
     var store = BoardStore.shared
 
     var dragElement: UUID?
@@ -184,7 +265,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     var didDrag = false
     var resizeElement: UUID?
     var resizeStart: NSPoint = .zero
-    var resizeOriginalFrame: NSRect = .zero
+    var resizeOriginalSize: NSSize = .zero
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
@@ -266,25 +347,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     // MARK: - Render
 
     func renderElements() {
-        removeHandles()
-        elementViews.values.forEach { $0.removeFromSuperview() }
-        elementViews.removeAll()
+        containers.values.forEach { $0.removeFromSuperview() }
+        containers.removeAll()
         for el in store.board.activeDesk.elements {
-            let view = createView(for: el)
-            canvasView.addSubview(view)
-            elementViews[el.id] = view
+            let container = createContainer(for: el)
+            canvasView.addSubview(container)
+            containers[el.id] = container
         }
-        if editMode { updateHandles() }
     }
 
-    func createView(for el: BoardElement) -> NSView {
+    func createContainer(for el: BoardElement) -> ElementContainerView {
         let frame = NSRect(x: el.x, y: el.y, width: el.w, height: el.h)
+        let content: NSView
         switch el.type {
         case .text:
-            let label = NSTextField(frame: frame)
+            let label = NSTextField(frame: .zero)
             label.stringValue = el.content
-            label.isEditable = false
-            label.isSelectable = false
+            label.isEditable = editMode
+            label.isSelectable = editMode
             label.isBordered = false
             label.drawsBackground = true
             label.backgroundColor = NSColor(white: 0.1, alpha: 0.85)
@@ -296,18 +376,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             label.delegate = self
             label.wantsLayer = true
             label.layer?.cornerRadius = 6
-            if editMode { label.layer?.borderColor = NSColor.systemBlue.cgColor; label.layer?.borderWidth = 2 }
-            return label
+            content = label
         case .image:
-            let imgView = NSImageView(frame: frame)
+            let imgView = NSImageView(frame: .zero)
             imgView.image = NSImage(contentsOfFile: el.content)
             imgView.imageScaling = .scaleProportionallyUpOrDown
             imgView.wantsLayer = true
             imgView.layer?.cornerRadius = 6
             imgView.layer?.masksToBounds = true
-            if editMode { imgView.layer?.borderColor = NSColor.systemBlue.cgColor; imgView.layer?.borderWidth = 2 }
-            return imgView
+            content = imgView
         }
+        if editMode {
+            content.layer?.borderColor = NSColor.systemBlue.cgColor
+            content.layer?.borderWidth = 2
+        }
+        let container = ElementContainerView(content: content)
+        container.layout(for: frame)
+        container.setHandlesVisible(editMode)
+        return container
     }
 
     // MARK: - Edit Mode
@@ -322,82 +408,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         canvas.makeKeyAndOrderFront(nil)
         NSApp.activate()
         canvasView.layer?.backgroundColor = NSColor(white: 0, alpha: 0.03).cgColor
-        elementViews.values.forEach {
-            $0.layer?.borderColor = NSColor.systemBlue.cgColor
-            $0.layer?.borderWidth = 2
-            if let tf = $0 as? NSTextField {
+        containers.values.forEach { c in
+            c.setHandlesVisible(true)
+            c.contentView.layer?.borderColor = NSColor.systemBlue.cgColor
+            c.contentView.layer?.borderWidth = 2
+            if let tf = c.contentView as? NSTextField {
                 tf.isEditable = true
                 tf.isSelectable = true
             }
         }
-        updateHandles()
     }
 
     func exitEditMode() {
         editMode = false
         canvas.ignoresMouseEvents = true
         canvasView.layer?.backgroundColor = nil
-        removeHandles()
-        elementViews.values.forEach {
-            $0.layer?.borderWidth = 0
-            if let tf = $0 as? NSTextField {
+        canvas.makeFirstResponder(nil)
+        containers.values.forEach { c in
+            c.setHandlesVisible(false)
+            c.contentView.layer?.borderWidth = 0
+            if let tf = c.contentView as? NSTextField {
                 tf.isEditable = false
                 tf.isSelectable = false
-                tf.currentEditor()?.selectedRange = NSRange(location: 0, length: 0)
-                canvas.makeFirstResponder(nil)
             }
         }
         savePositions()
-    }
-
-    // MARK: - Handles (outside elements, on canvasView)
-
-    var dragHandles: [UUID: NSView] = [:]
-    var resizeHandles: [UUID: NSView] = [:]
-
-    func updateHandles() {
-        removeHandles()
-        let s: CGFloat = 12
-        for (id, view) in elementViews {
-            // Drag handle — top center, above element
-            let dh = makeHandle(color: .systemBlue)
-            dh.frame = NSRect(x: view.frame.midX - s/2, y: view.frame.minY - s - 4, width: s, height: s)
-            canvasView.addSubview(dh)
-            dragHandles[id] = dh
-
-            // Resize handle — bottom right, below element
-            let rh = makeHandle(color: .systemOrange)
-            rh.frame = NSRect(x: view.frame.maxX - s/2, y: view.frame.maxY + 4, width: s, height: s)
-            canvasView.addSubview(rh)
-            resizeHandles[id] = rh
-        }
-    }
-
-    func makeHandle(color: NSColor) -> NSView {
-        let v = NSView()
-        v.wantsLayer = true
-        v.layer?.backgroundColor = color.cgColor
-        v.layer?.cornerRadius = 6
-        return v
-    }
-
-    func removeHandles() {
-        dragHandles.values.forEach { $0.removeFromSuperview() }
-        resizeHandles.values.forEach { $0.removeFromSuperview() }
-        dragHandles.removeAll()
-        resizeHandles.removeAll()
-    }
-
-    func syncHandlePositions() {
-        let s: CGFloat = 12
-        for (id, view) in elementViews {
-            if let dh = dragHandles[id] {
-                dh.frame = NSRect(x: view.frame.midX - s/2, y: view.frame.minY - s - 4, width: s, height: s)
-            }
-            if let rh = resizeHandles[id] {
-                rh.frame = NSRect(x: view.frame.maxX - s/2, y: view.frame.maxY + 4, width: s, height: s)
-            }
-        }
     }
 
     // MARK: - Add Text (from menu)
@@ -443,12 +478,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             let el = BoardElement(type: .text, content: text, x: frame.origin.x, y: frame.origin.y, w: frame.width, h: frame.height)
             store.board.activeDesk.elements.append(el)
             store.save()
-            let view = createView(for: el)
-            canvasView.addSubview(view)
-            elementViews[el.id] = view
-            if editMode { updateHandles() }
+            let container = createContainer(for: el)
+            canvasView.addSubview(container)
+            containers[el.id] = container
         } else {
-            if let id = elementViews.first(where: { $0.value === field })?.key,
+            if let id = containers.first(where: { $0.value.contentView === field })?.key,
                let idx = store.board.activeDesk.elements.firstIndex(where: { $0.id == id }) {
                 store.board.activeDesk.elements[idx].content = field.stringValue
                 store.save()
@@ -458,37 +492,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     // MARK: - Hit Testing
 
-    func hitTest(_ point: NSPoint) -> (UUID, NSView)? {
-        for (id, view) in elementViews {
-            if view.frame.contains(point) { return (id, view) }
+    func hitTest(_ point: NSPoint) -> (UUID, ElementContainerView)? {
+        for (id, c) in containers {
+            if c.contentFrame.contains(point) { return (id, c) }
         }
         return nil
     }
 
-    func hitTestBorder(_ point: NSPoint) -> (UUID, NSView)? {
-        for (id, handle) in dragHandles {
-            if handle.frame.contains(point), let view = elementViews[id] { return (id, view) }
+    func hitTestBorder(_ point: NSPoint) -> (UUID, ElementContainerView)? {
+        for (id, c) in containers {
+            if c.dragHandleFrame.contains(point) { return (id, c) }
         }
         return nil
     }
 
-    func hitTestResizeHandle(_ point: NSPoint) -> (UUID, NSView)? {
-        for (id, handle) in resizeHandles {
-            if handle.frame.contains(point), let view = elementViews[id] { return (id, view) }
+    func hitTestResizeHandle(_ point: NSPoint) -> (UUID, ElementContainerView)? {
+        for (id, c) in containers {
+            if c.resizeHandleFrame.contains(point) { return (id, c) }
         }
         return nil
     }
 
-    func elementType(_ id: UUID) -> BoardElement.ElementType? {
-        store.board.activeDesk.elements.first { $0.id == id }?.type
-    }
+
 
     // MARK: - Delete
 
     func deleteSelectedElement() {
-        guard let id = dragElement, let view = elementViews[id] else { return }
-        view.removeFromSuperview()
-        elementViews.removeValue(forKey: id)
+        guard let id = dragElement, let c = containers[id] else { return }
+        c.removeFromSuperview()
+        containers.removeValue(forKey: id)
         store.board.activeDesk.elements.removeAll { $0.id == id }
         store.save()
         dragElement = nil
@@ -497,12 +529,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     // MARK: - Save Positions
 
     func savePositions() {
-        for (id, view) in elementViews {
+        for (id, c) in containers {
             if let idx = store.board.activeDesk.elements.firstIndex(where: { $0.id == id }) {
-                store.board.activeDesk.elements[idx].x = view.frame.origin.x
-                store.board.activeDesk.elements[idx].y = view.frame.origin.y
-                store.board.activeDesk.elements[idx].w = view.frame.width
-                store.board.activeDesk.elements[idx].h = view.frame.height
+                let f = c.contentFrame
+                store.board.activeDesk.elements[idx].x = f.origin.x
+                store.board.activeDesk.elements[idx].y = f.origin.y
+                store.board.activeDesk.elements[idx].w = f.width
+                store.board.activeDesk.elements[idx].h = f.height
             }
         }
         store.save()
@@ -533,10 +566,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     func addElement(_ el: BoardElement) {
         store.board.activeDesk.elements.append(el)
         store.save()
-        let view = createView(for: el)
-        canvasView.addSubview(view)
-        elementViews[el.id] = view
-        if editMode { updateHandles() }
+        let container = createContainer(for: el)
+        canvasView.addSubview(container)
+        containers[el.id] = container
     }
 
     // MARK: - Desks
