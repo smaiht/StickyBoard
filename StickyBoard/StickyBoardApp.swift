@@ -11,6 +11,7 @@ struct BoardElement: Codable, Identifiable {
     var y: Double
     var w: Double
     var h: Double
+    var rotation: Double
 
     enum ElementType: String, Codable { case text, image }
 
@@ -18,6 +19,19 @@ struct BoardElement: Codable, Identifiable {
         self.id = UUID()
         self.type = type; self.content = content
         self.x = x; self.y = y; self.w = w; self.h = h
+        self.rotation = 0
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        type = try c.decode(ElementType.self, forKey: .type)
+        content = try c.decode(String.self, forKey: .content)
+        x = try c.decode(Double.self, forKey: .x)
+        y = try c.decode(Double.self, forKey: .y)
+        w = try c.decode(Double.self, forKey: .w)
+        h = try c.decode(Double.self, forKey: .h)
+        rotation = try c.decodeIfPresent(Double.self, forKey: .rotation) ?? 0
     }
 }
 
@@ -92,6 +106,16 @@ struct StickyBoardApp: App {
 class CanvasWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
+        let result = super.makeFirstResponder(responder)
+        if result, responder is NSTextView || responder is NSTextField {
+            AppDelegate.shared?.wasEditingText = true
+        } else if result, responder is CanvasView {
+            // Don't clear here — mouseDown will handle it
+        }
+        return result
+    }
 }
 
 // MARK: - Canvas View
@@ -104,6 +128,24 @@ class CanvasView: NSView {
     override func mouseDown(with event: NSEvent) {
         guard let d = appDelegate, d.editMode else { return }
         let loc = convert(event.locationInWindow, from: nil)
+
+        // Delete handle
+        if let (id, _) = d.hitTestDelete(loc) {
+            d.deleteElement(id); return
+        }
+
+        // Menu handle
+        if let (id, c) = d.hitTestMenu(loc) {
+            d.showElementMenu(id, at: c.menuHandleFrame.origin); return
+        }
+
+        // Rotate handle
+        if let (id, c) = d.hitTestRotate(loc) {
+            d.rotateElement = id
+            d.rotateStart = loc
+            d.rotateOriginalAngle = c.rotation
+            return
+        }
 
         // Resize handle
         if let (id, c) = d.hitTestResizeHandle(loc) {
@@ -125,15 +167,26 @@ class CanvasView: NSView {
         // Click inside element content → let text field handle it
         if d.hitTest(loc) != nil { return }
 
-        // Empty space → exit edit mode
-        d.exitEditMode()
+        // Empty space
+        if d.wasEditingText {
+            d.wasEditingText = false
+            d.canvas.makeFirstResponder(d.canvasView)
+        } else {
+            d.exitEditMode()
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard let d = appDelegate, d.editMode else { return }
         let loc = convert(event.locationInWindow, from: nil)
 
-        if let id = d.resizeElement, let c = d.containers[id] {
+        if let id = d.rotateElement, let c = d.containers[id] {
+            let center = NSPoint(x: c.contentFrame.midX, y: c.contentFrame.midY)
+            let startAngle = atan2(d.rotateStart.y - center.y, d.rotateStart.x - center.x)
+            let curAngle = atan2(loc.y - center.y, loc.x - center.x)
+            let delta = (curAngle - startAngle) * 180 / .pi
+            c.applyRotation(d.rotateOriginalAngle + delta)
+        } else if let id = d.resizeElement, let c = d.containers[id] {
             let dx = loc.x - d.resizeStart.x
             let dy = loc.y - d.resizeStart.y
             let newSize = NSSize(width: max(40, d.resizeOriginalSize.width + dx),
@@ -151,16 +204,15 @@ class CanvasView: NSView {
         guard let d = appDelegate, d.editMode else { return }
         d.dragElement = nil
         d.resizeElement = nil
+        d.rotateElement = nil
         d.didDrag = false
         d.savePositions()
     }
 
     override func keyDown(with event: NSEvent) {
         guard let d = appDelegate, d.editMode else { return }
-        // If a text field is active, don't intercept keys
         if d.canvas.firstResponder is NSTextView { return }
         if event.keyCode == 53 { d.exitEditMode() } // Esc
-        else if event.keyCode == 51 { d.deleteSelectedElement() } // Delete
     }
 }
 
@@ -171,27 +223,43 @@ class ElementContainerView: NSView {
     let contentView: NSView
     let dragHandle = NSView()
     let resizeHandle = NSView()
+    let deleteHandle = NSView()
+    let rotateHandle = NSView()
+    let menuHandle = NSView()
     private let handleSize: CGFloat = 12
+    var rotation: CGFloat = 0
 
     init(content: NSView) {
         self.contentView = content
         super.init(frame: .zero)
         wantsLayer = true
 
-        // Content fills container
         addSubview(contentView)
 
-        // Drag handle — blue circle, top center
         dragHandle.wantsLayer = true
         dragHandle.layer?.backgroundColor = NSColor.systemBlue.cgColor
         dragHandle.layer?.cornerRadius = handleSize / 2
         addSubview(dragHandle)
 
-        // Resize handle — orange circle, bottom right
         resizeHandle.wantsLayer = true
         resizeHandle.layer?.backgroundColor = NSColor.systemOrange.cgColor
         resizeHandle.layer?.cornerRadius = handleSize / 2
         addSubview(resizeHandle)
+
+        deleteHandle.wantsLayer = true
+        deleteHandle.layer?.backgroundColor = NSColor.systemRed.cgColor
+        deleteHandle.layer?.cornerRadius = handleSize / 2
+        addSubview(deleteHandle)
+
+        rotateHandle.wantsLayer = true
+        rotateHandle.layer?.backgroundColor = NSColor.systemGreen.cgColor
+        rotateHandle.layer?.cornerRadius = handleSize / 2
+        addSubview(rotateHandle)
+
+        menuHandle.wantsLayer = true
+        menuHandle.layer?.backgroundColor = NSColor.systemGray.cgColor
+        menuHandle.layer?.cornerRadius = handleSize / 2
+        addSubview(menuHandle)
 
         setHandlesVisible(false)
     }
@@ -200,17 +268,40 @@ class ElementContainerView: NSView {
 
     func layout(for elementFrame: NSRect) {
         let pad: CGFloat = handleSize + 4
-        // Container is larger than content to fit handles
-        frame = NSRect(x: elementFrame.origin.x, y: elementFrame.origin.y - pad,
-                       width: elementFrame.width, height: elementFrame.height + pad * 2)
-        contentView.frame = NSRect(x: 0, y: pad, width: elementFrame.width, height: elementFrame.height)
-        dragHandle.frame = NSRect(x: (elementFrame.width - handleSize) / 2, y: 0, width: handleSize, height: handleSize)
-        resizeHandle.frame = NSRect(x: elementFrame.width - handleSize / 2, y: pad + elementFrame.height + 4, width: handleSize, height: handleSize)
+        frame = NSRect(x: elementFrame.origin.x - pad, y: elementFrame.origin.y - pad,
+                       width: elementFrame.width + pad * 2, height: elementFrame.height + pad * 2)
+        contentView.frame = NSRect(x: pad, y: pad, width: elementFrame.width, height: elementFrame.height)
+        // Top: delete(left) — drag(center) — rotate(right)
+        deleteHandle.frame = NSRect(x: 0, y: 0, width: handleSize, height: handleSize)
+        dragHandle.frame = NSRect(x: (frame.width - handleSize) / 2, y: 0, width: handleSize, height: handleSize)
+        rotateHandle.frame = NSRect(x: frame.width - handleSize, y: 0, width: handleSize, height: handleSize)
+        // Bottom-right: resize
+        resizeHandle.frame = NSRect(x: frame.width - handleSize, y: frame.height - handleSize, width: handleSize, height: handleSize)
+        // Left-center: menu
+        menuHandle.frame = NSRect(x: 0, y: (frame.height - handleSize) / 2, width: handleSize, height: handleSize)
     }
 
     func setHandlesVisible(_ visible: Bool) {
         dragHandle.isHidden = !visible
         resizeHandle.isHidden = !visible
+        deleteHandle.isHidden = !visible
+        rotateHandle.isHidden = !visible
+        menuHandle.isHidden = !visible
+    }
+
+    /// Convert a point from superview coords to local coords accounting for rotation
+    func localPoint(from point: NSPoint) -> NSPoint {
+        convert(point, from: superview)
+    }
+
+    func hitHandle(_ handle: NSView, point: NSPoint) -> Bool {
+        let local = localPoint(from: point)
+        return handle.frame.insetBy(dx: -4, dy: -4).contains(local)
+    }
+
+    func hitContent(point: NSPoint) -> Bool {
+        let local = localPoint(from: point)
+        return contentView.frame.contains(local)
     }
 
     /// Content frame in canvasView coordinates
@@ -234,23 +325,53 @@ class ElementContainerView: NSView {
                width: resizeHandle.frame.width, height: resizeHandle.frame.height)
     }
 
+    /// Delete handle frame in canvasView coordinates
+    var deleteHandleFrame: NSRect {
+        NSRect(x: frame.origin.x + deleteHandle.frame.origin.x,
+               y: frame.origin.y + deleteHandle.frame.origin.y,
+               width: deleteHandle.frame.width, height: deleteHandle.frame.height)
+    }
+
+    var rotateHandleFrame: NSRect {
+        NSRect(x: frame.origin.x + rotateHandle.frame.origin.x,
+               y: frame.origin.y + rotateHandle.frame.origin.y,
+               width: rotateHandle.frame.width, height: rotateHandle.frame.height)
+    }
+
+    var menuHandleFrame: NSRect {
+        NSRect(x: frame.origin.x + menuHandle.frame.origin.x,
+               y: frame.origin.y + menuHandle.frame.origin.y,
+               width: menuHandle.frame.width, height: menuHandle.frame.height)
+    }
+
     func updateContentSize(_ size: NSSize) {
         let pad: CGFloat = handleSize + 4
-        frame.size = NSSize(width: size.width, height: size.height + pad * 2)
+        frame.size = NSSize(width: size.width + pad * 2, height: size.height + pad * 2)
         contentView.frame.size = size
-        dragHandle.frame.origin.x = (size.width - handleSize) / 2
-        resizeHandle.frame = NSRect(x: size.width - handleSize / 2, y: pad + size.height + 4, width: handleSize, height: handleSize)
+        dragHandle.frame.origin.x = (frame.width - handleSize) / 2
+        rotateHandle.frame.origin.x = frame.width - handleSize
+        resizeHandle.frame = NSRect(x: frame.width - handleSize, y: frame.height - handleSize, width: handleSize, height: handleSize)
+        menuHandle.frame.origin.y = (frame.height - handleSize) / 2
     }
 
     func updatePosition(_ origin: NSPoint) {
         let pad: CGFloat = handleSize + 4
-        frame.origin = NSPoint(x: origin.x, y: origin.y - pad)
+        frame.origin = NSPoint(x: origin.x - pad, y: origin.y - pad)
+    }
+
+    func applyRotation(_ degrees: CGFloat) {
+        rotation = degrees
+        frameCenterRotation = degrees
+    }
+
+    override func resetCursorRects() {
+        // Don't let subviews set cursor rects — we control it
     }
 }
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuDelegate {
     static weak var shared: AppDelegate?
     var statusItem: NSStatusItem!
     var canvas: NSWindow!
@@ -263,9 +384,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     var dragStart: NSPoint = .zero
     var dragOrigin: NSPoint = .zero
     var didDrag = false
+    var wasEditingText = false
     var resizeElement: UUID?
     var resizeStart: NSPoint = .zero
     var resizeOriginalSize: NSSize = .zero
+    var rotateElement: UUID?
+    var rotateStart: NSPoint = .zero
+    var rotateOriginalAngle: CGFloat = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Self.shared = self
@@ -324,6 +449,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
         let newDesk = NSMenuItem(title: "New Desk…", action: #selector(newDesk), keyEquivalent: "")
         newDesk.target = self; desksMenu.addItem(newDesk)
+        let delDesk = NSMenuItem(title: "Delete Current Desk", action: #selector(deleteCurrentDesk), keyEquivalent: "")
+        delDesk.target = self; desksMenu.addItem(delDesk)
         desksMenu.addItem(.separator())
         for (i, desk) in store.board.desks.enumerated() {
             let item = NSMenuItem(title: desk.name, action: #selector(switchDesk(_:)), keyEquivalent: "")
@@ -340,6 +467,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         quit.target = self; menu.addItem(quit)
 
         statusItem.menu = menu
+        menu.delegate = self
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        if !editMode { enterEditMode() }
     }
 
     func rebuildMenu() { statusItem.menu = nil; setupMenu() }
@@ -389,10 +521,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         if editMode {
             content.layer?.borderColor = NSColor.systemBlue.cgColor
             content.layer?.borderWidth = 2
-        }
+        }  
         let container = ElementContainerView(content: content)
         container.layout(for: frame)
         container.setHandlesVisible(editMode)
+        if el.rotation != 0 { container.applyRotation(CGFloat(el.rotation)) }
         return container
     }
 
@@ -407,6 +540,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         canvas.ignoresMouseEvents = false
         canvas.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        canvas.makeFirstResponder(canvasView)
         canvasView.layer?.backgroundColor = NSColor(white: 0, alpha: 0.03).cgColor
         containers.values.forEach { c in
             c.setHandlesVisible(true)
@@ -467,6 +601,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     // MARK: - Save on edit end
 
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+        if sel == #selector(NSResponder.cancelOperation(_:)) {
+            wasEditingText = false
+            canvas.makeFirstResponder(canvasView)
+            return true
+        }
+        if sel == #selector(NSResponder.insertNewline(_:)) {
+            textView.insertNewlineIgnoringFieldEditor(nil)
+            return true
+        }
+        return false
+    }
+
     func controlTextDidEndEditing(_ obj: Notification) {
         guard let field = obj.object as? NSTextField else { return }
 
@@ -494,21 +641,42 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     func hitTest(_ point: NSPoint) -> (UUID, ElementContainerView)? {
         for (id, c) in containers {
-            if c.contentFrame.contains(point) { return (id, c) }
+            if c.hitContent(point: point) { return (id, c) }
         }
         return nil
     }
 
     func hitTestBorder(_ point: NSPoint) -> (UUID, ElementContainerView)? {
         for (id, c) in containers {
-            if c.dragHandleFrame.contains(point) { return (id, c) }
+            if c.hitHandle(c.dragHandle, point: point) { return (id, c) }
         }
         return nil
     }
 
     func hitTestResizeHandle(_ point: NSPoint) -> (UUID, ElementContainerView)? {
         for (id, c) in containers {
-            if c.resizeHandleFrame.contains(point) { return (id, c) }
+            if c.hitHandle(c.resizeHandle, point: point) { return (id, c) }
+        }
+        return nil
+    }
+
+    func hitTestDelete(_ point: NSPoint) -> (UUID, ElementContainerView)? {
+        for (id, c) in containers {
+            if c.hitHandle(c.deleteHandle, point: point) { return (id, c) }
+        }
+        return nil
+    }
+
+    func hitTestRotate(_ point: NSPoint) -> (UUID, ElementContainerView)? {
+        for (id, c) in containers {
+            if c.hitHandle(c.rotateHandle, point: point) { return (id, c) }
+        }
+        return nil
+    }
+
+    func hitTestMenu(_ point: NSPoint) -> (UUID, ElementContainerView)? {
+        for (id, c) in containers {
+            if c.hitHandle(c.menuHandle, point: point) { return (id, c) }
         }
         return nil
     }
@@ -517,13 +685,50 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     // MARK: - Delete
 
-    func deleteSelectedElement() {
-        guard let id = dragElement, let c = containers[id] else { return }
+    func deleteElement(_ id: UUID) {
+        guard let c = containers[id] else { return }
         c.removeFromSuperview()
         containers.removeValue(forKey: id)
         store.board.activeDesk.elements.removeAll { $0.id == id }
         store.save()
-        dragElement = nil
+    }
+
+    // MARK: - Element Context Menu
+
+    func showElementMenu(_ id: UUID, at point: NSPoint) {
+        guard let el = store.board.activeDesk.elements.first(where: { $0.id == id }) else { return }
+        let menu = NSMenu()
+
+        if el.type == .text {
+            menu.addItem(NSMenuItem(title: "Font Size…", action: nil, keyEquivalent: ""))
+            menu.addItem(NSMenuItem(title: "Text Color…", action: nil, keyEquivalent: ""))
+            menu.addItem(.separator())
+        }
+        if el.type == .image {
+            menu.addItem(NSMenuItem(title: "Resize to Original", action: nil, keyEquivalent: ""))
+            menu.addItem(.separator())
+        }
+
+        let copy = NSMenuItem(title: "Copy", action: #selector(copyElement(_:)), keyEquivalent: "")
+        copy.target = self; copy.representedObject = id; menu.addItem(copy)
+        let del = NSMenuItem(title: "Delete", action: #selector(deleteFromMenu(_:)), keyEquivalent: "")
+        del.target = self; del.representedObject = id; menu.addItem(del)
+
+        menu.popUp(positioning: nil, at: point, in: canvasView)
+    }
+
+    @objc func copyElement(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID,
+              let el = store.board.activeDesk.elements.first(where: { $0.id == id }) else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if el.type == .text { pb.setString(el.content, forType: .string) }
+        else if let img = NSImage(contentsOfFile: el.content) { pb.writeObjects([img]) }
+    }
+
+    @objc func deleteFromMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        deleteElement(id)
     }
 
     // MARK: - Save Positions
@@ -536,6 +741,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 store.board.activeDesk.elements[idx].y = f.origin.y
                 store.board.activeDesk.elements[idx].w = f.width
                 store.board.activeDesk.elements[idx].h = f.height
+                store.board.activeDesk.elements[idx].rotation = Double(c.rotation)
             }
         }
         store.save()
@@ -592,6 +798,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     @objc func switchDesk(_ sender: NSMenuItem) {
         if editMode { exitEditMode() }
         store.board.activeDeskIndex = sender.tag
+        store.save(); renderElements(); rebuildMenu()
+    }
+
+    @objc func deleteCurrentDesk() {
+        if editMode { exitEditMode() }
+        if store.board.desks.count > 1 {
+            store.board.desks.remove(at: store.board.activeDeskIndex)
+            store.board.activeDeskIndex = max(0, store.board.activeDeskIndex - 1)
+        } else {
+            store.board.desks[0] = Desk(name: "Default", elements: [])
+        }
         store.save(); renderElements(); rebuildMenu()
     }
 
