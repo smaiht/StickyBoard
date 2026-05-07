@@ -427,6 +427,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuD
     var canvas: NSWindow!
     var canvasView: CanvasView!
     var editMode = false
+    var globalClickMonitor: Any?
     var containers: [UUID: ElementContainerView] = [:]
     var store = BoardStore.shared
 
@@ -617,10 +618,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuD
             c.setBorderVisible(true)
             c.setHandlesVisible(false)
         }
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.exitEditMode()
+        }
     }
 
     func exitEditMode() {
         editMode = false
+        if let m = globalClickMonitor { NSEvent.removeMonitor(m); globalClickMonitor = nil }
         deselectElement()
         canvas.ignoresMouseEvents = true
         canvas.resignKey()
