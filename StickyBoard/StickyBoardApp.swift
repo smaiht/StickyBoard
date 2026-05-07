@@ -5,6 +5,30 @@ import AppKit
 
 let kEditOverlayAlpha: CGFloat = 0.3
 let kEditFadeDuration: CFTimeInterval = 0.15
+let kBorderWidth: CGFloat = 3
+let kContentPadding: CGFloat = kBorderWidth
+
+// MARK: - Padded Text Field Cell
+
+class PaddedTextFieldCell: NSTextFieldCell {
+    private var insets: NSRect { NSRect(x: kContentPadding, y: kContentPadding, width: -kContentPadding * 2, height: -kContentPadding * 2) }
+    
+    private func padded(_ rect: NSRect) -> NSRect {
+        rect.insetBy(dx: kContentPadding, dy: kContentPadding)
+    }
+
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        super.drawingRect(forBounds: padded(rect))
+    }
+
+    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
+        super.edit(withFrame: padded(rect), in: controlView, editor: textObj, delegate: delegate, event: event)
+    }
+
+    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
+        super.select(withFrame: padded(rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
+    }
+}
 
 // MARK: - Data Model
 
@@ -283,8 +307,7 @@ class ElementContainerView: NSView {
         frame = NSRect(x: elementFrame.origin.x - pad, y: elementFrame.origin.y - pad,
                        width: elementFrame.width + pad * 2, height: elementFrame.height + pad * 2)
         contentView.frame = NSRect(x: pad, y: pad, width: elementFrame.width, height: elementFrame.height)
-        // All handles at same offset from content edges
-        let hOff: CGFloat = -2 // overlap slightly with padding area
+        let hOff: CGFloat = -2
         deleteHandle.frame = NSRect(x: hOff, y: hOff, width: handleSize, height: handleSize)
         dragHandle.frame = NSRect(x: (frame.width - handleSize) / 2, y: hOff, width: handleSize, height: handleSize)
         rotateHandle.frame = NSRect(x: frame.width - handleSize - hOff, y: hOff, width: handleSize, height: handleSize)
@@ -298,6 +321,12 @@ class ElementContainerView: NSView {
         deleteHandle.isHidden = !visible
         rotateHandle.isHidden = !visible
         menuHandle.isHidden = !visible
+        contentView.layer?.borderColor = visible ? NSColor.systemOrange.cgColor : NSColor.systemBlue.cgColor
+    }
+
+    func setBorderVisible(_ visible: Bool) {
+        contentView.layer?.borderWidth = visible ? kBorderWidth : 0
+        contentView.layer?.borderColor = NSColor.systemBlue.cgColor
     }
 
     /// Convert a point from superview coords to local coords accounting for rotation
@@ -539,6 +568,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuD
         switch el.type {
         case .text:
             let label = NSTextField(frame: .zero)
+            label.cell = PaddedTextFieldCell()
             label.stringValue = el.content
             label.isEditable = editMode
             label.isSelectable = editMode
@@ -563,13 +593,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuD
             imgView.layer?.masksToBounds = true
             content = imgView
         }
-        if editMode {
-            content.layer?.borderColor = NSColor.systemBlue.cgColor
-            content.layer?.borderWidth = 2
-        }  
         let container = ElementContainerView(content: content)
         container.layout(for: frame)
         container.setHandlesVisible(false)
+        if editMode { container.setBorderVisible(true) }
         if el.rotation != 0 { container.applyRotation(CGFloat(el.rotation)) }
         return container
     }
@@ -587,8 +614,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuD
         canvas.makeFirstResponder(canvasView)
         animateBackground(to: NSColor(white: 0, alpha: kEditOverlayAlpha))
         containers.values.forEach { c in
-            c.contentView.layer?.borderColor = NSColor.systemBlue.cgColor
-            c.contentView.layer?.borderWidth = 2
+            c.setBorderVisible(true)
             c.setHandlesVisible(false)
         }
     }
@@ -599,7 +625,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuD
         canvas.ignoresMouseEvents = true
         canvas.resignKey()
         containers.values.forEach { c in
-            c.contentView.layer?.borderWidth = 0
+            c.setBorderVisible(false)
+            c.setHandlesVisible(false)
             if let tf = c.contentView as? NSTextField {
                 tf.isEditable = false
                 tf.isSelectable = false
@@ -622,6 +649,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSMenuD
         deselectElement()
         selectedElement = id
         guard let c = containers[id] else { return }
+        canvasView.addSubview(c, positioned: .above, relativeTo: nil)
         c.setHandlesVisible(true)
         if let tf = c.contentView as? NSTextField {
             tf.isEditable = true
